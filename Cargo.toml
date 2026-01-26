@@ -1,0 +1,8 @@
+[package]
+name = "gar-lib"
+version = "0.1.0"
+edition = "2021"
+description = "Library for reading Giants GAR archives with VFS support"
+
+[dependencies]
+vfs = "0.12"
