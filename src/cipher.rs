@@ -270,28 +270,25 @@ impl GarCipher {
     /// Process a single 8-byte block through the Feistel cipher.
     ///
     /// - `num_rounds`: number of Feistel rounds (0 for IP-only pass-through)
-    /// - `subkey_pairs`: slice of (ka, kb) pairs, applied in order
     /// - `rc4_state`: if Some, XOR with RC4 keystream after Feistel rounds
+    ///
+    /// Subkeys are computed inline: round i uses key index `2*(num_rounds-1) - 2*i`,
+    /// counting down from the highest subkey pair to [0,1].
     fn process_block(
         &self,
         block: &[u8],
         num_rounds: usize,
-        subkey_pairs: &[(u32, u32)],
         rc4_state: Option<&mut [u8; 256]>,
     ) -> [u8; 8] {
         let (even, odd) = initial_permutation(block);
 
         // Feistel network: F operates on `b` (odd half), XOR into `a` (even half).
-        // No final swap — (a, b) after all rounds is already in correct FP order.
-        //   0 rounds: (even, odd) → FP(even, odd) ✓
-        //   1 round:  (odd, even^F) → FP(odd, even^F) ✓
-        //   N rounds: correct by induction ✓
         let mut a = even;
         let mut b = odd;
 
         for i in 0..num_rounds {
-            let (ka, kb) = subkey_pairs[i];
-            let f_out = self.feistel_round(b, ka, kb);
+            let key_idx = 2 * (num_rounds - 1) - 2 * i;
+            let f_out = self.feistel_round(b, self.subkeys[key_idx], self.subkeys[key_idx + 1]);
             let next = a ^ f_out;
             a = b;
             b = next;
@@ -310,43 +307,13 @@ impl GarCipher {
         final_permutation(fp1, fp2)
     }
 
-    /// Build the subkey pair schedule for a given block number.
-    ///
-    /// Returns (num_rounds, subkey_pairs) where subkey_pairs are ordered
-    /// from highest key index down to [0,1].
-    fn block_subkey_schedule(&self, block_num: usize) -> (usize, Vec<(u32, u32)>) {
-        let num_rounds = (block_num + 1) / 2; // block 2→1, 3-4→2, 5-6→3, etc.
-        let start_key_idx = 2 * (num_rounds - 1);
-
-        let mut pairs = Vec::with_capacity(num_rounds);
-        for phase in 0..num_rounds {
-            let key_idx = start_key_idx - 2 * phase;
-            pairs.push((self.subkeys[key_idx], self.subkeys[key_idx + 1]));
-        }
-
-        (num_rounds, pairs)
-    }
-
     /// Decrypt data using the full multi-block cipher.
-    /// Decrypts all blocks including the last one.
-    pub fn decrypt(&self, data: &[u8]) -> Vec<u8> {
-        self.decrypt_internal(data, true)
-    }
-
-    /// Decrypt data for DLC files — same as decrypt.
-    pub fn decrypt_dlc(&self, data: &[u8]) -> Vec<u8> {
-        self.decrypt_internal(data, true)
-    }
-
-    /// Internal decrypt with option to skip last block.
     ///
     /// 34-block cycle:
-    ///   pos 0:       block 1 (1 round, keys[0,1], no RC4)
-    ///   pos 1-31:    blocks 2-32 (ceil(N/2) rounds, keys descending, RC4 on even N)
-    ///   pos 32:      ESI1 — IP-only pass-through (0 rounds, no RC4)
-    ///   pos 33:      ESI3 — IP-only with RC4 (0 rounds, RC4)
-    ///   pos 34:      block 1 again (new cycle)
-    fn decrypt_internal(&self, data: &[u8], decrypt_last_block: bool) -> Vec<u8> {
+    ///   cycle_pos 0..=31: Feistel blocks (block_num = cycle_pos + 1)
+    ///   cycle_pos 32:     ESI1 — IP-only pass-through (0 rounds, no RC4)
+    ///   cycle_pos 33:     ESI3 — IP-only with RC4 (0 rounds, RC4)
+    pub fn decrypt(&self, data: &[u8]) -> Vec<u8> {
         assert!(data.len() % 8 == 0, "Data length must be multiple of 8");
 
         let num_blocks = data.len() / 8;
@@ -360,55 +327,37 @@ impl GarCipher {
         let mut result = Vec::with_capacity(data.len());
         let mut rc4_state = self.rc4_sbox_template;
 
-        let last_pos = if num_blocks == 32 || decrypt_last_block {
-            num_blocks
-        } else {
-            num_blocks - 1
-        };
-
-        for pos in 0..last_pos {
+        for pos in 0..num_blocks {
             let block = &data[pos * 8..(pos + 1) * 8];
+            let cycle_pos = pos % 34;
 
-            let decrypted = if pos == 0 {
-                // Block 1: 1 round, subkeys[0,1], no RC4
-                let pairs = [(self.subkeys[0], self.subkeys[1])];
-                self.process_block(block, 1, &pairs, None)
-            } else {
-                let pos_in_cycle = (pos - 1) % 34;
+            let decrypted = if cycle_pos <= 31 {
+                let block_num = cycle_pos + 1;
+                let num_rounds = (block_num + 1) / 2;
+                let use_rc4 = block_num % 2 == 0;
 
-                if pos_in_cycle < 31 {
-                    // Blocks 2-32
-                    let block_num = pos_in_cycle + 2;
-                    let (num_rounds, pairs) = self.block_subkey_schedule(block_num);
-                    let use_rc4 = block_num % 2 == 0;
-
-                    if use_rc4 {
-                        self.process_block(block, num_rounds, &pairs, Some(&mut rc4_state))
-                    } else {
-                        self.process_block(block, num_rounds, &pairs, None)
-                    }
-                } else if pos_in_cycle == 31 {
-                    // ESI1: IP-only, no RC4
-                    self.process_block(block, 0, &[], None)
-                } else if pos_in_cycle == 32 {
-                    // ESI3: IP-only, with RC4
-                    self.process_block(block, 0, &[], Some(&mut rc4_state))
+                if use_rc4 {
+                    self.process_block(block, num_rounds, Some(&mut rc4_state))
                 } else {
-                    // pos_in_cycle == 33: block 1 again
-                    let pairs = [(self.subkeys[0], self.subkeys[1])];
-                    self.process_block(block, 1, &pairs, None)
+                    self.process_block(block, num_rounds, None)
                 }
+            } else if cycle_pos == 32 {
+                // ESI1: IP-only, no RC4
+                self.process_block(block, 0, None)
+            } else {
+                // ESI3: IP-only, with RC4
+                self.process_block(block, 0, Some(&mut rc4_state))
             };
 
             result.extend_from_slice(&decrypted);
         }
 
-        // Zero padding for non-DLC when not decrypting last block
-        if num_blocks != 32 && !decrypt_last_block {
-            result.extend_from_slice(&[0u8; 8]);
-        }
-
         result
+    }
+
+    /// Decrypt data for DLC files — identical to decrypt.
+    pub fn decrypt_dlc(&self, data: &[u8]) -> Vec<u8> {
+        self.decrypt(data)
     }
 }
 
